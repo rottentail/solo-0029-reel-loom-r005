@@ -1,7 +1,7 @@
 from contextlib import contextmanager
 import json
 import sqlite3
-from .schema import SCHEMA, SCHEMA_VERSION
+from .schema import SCHEMA, SCHEMA_VERSION, MIGRATIONS, INDEXES
 from .errors import LoomError
 from .values import canonical, now
 
@@ -25,8 +25,19 @@ class Database:
             row = db.execute("SELECT version FROM schema_info").fetchone()
             if row is None:
                 db.execute("INSERT INTO schema_info VALUES(?)", (SCHEMA_VERSION,))
-            elif row["version"] != SCHEMA_VERSION:
+            elif row["version"] == SCHEMA_VERSION:
+                for statement in INDEXES:
+                    db.execute(statement)
+                return
+            elif row["version"] < SCHEMA_VERSION:
+                for version in range(row["version"] + 1, SCHEMA_VERSION + 1):
+                    for statement in MIGRATIONS[version]:
+                        db.execute(statement)
+                db.execute("UPDATE schema_info SET version=?", (SCHEMA_VERSION,))
+            else:
                 raise RuntimeError("Unsupported database schema")
+            for statement in INDEXES:
+                db.execute(statement)
 
     @contextmanager
     def write_unit(self):

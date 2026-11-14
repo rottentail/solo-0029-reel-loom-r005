@@ -11,7 +11,10 @@ class Assets:
 
     def _availability_for(self, asset):
         cached = self._availability.get(asset["id"])
+        # The cache only memoizes the blob identity; availability state is
+        # always taken from the current row so retirement is seen immediately.
         if cached is not None and cached["blob"] == asset["blob"]:
+            cached["state"] = asset["state"]
             return dict(cached)
         availability = {
             "asset": asset["id"],
@@ -76,6 +79,7 @@ class Assets:
             asset = self.get(asset_id, db)
             if asset["state"] == "ready":
                 db.execute("UPDATE assets SET state='retired' WHERE id=?", (asset_id,))
+                self._availability.pop(asset_id, None)
                 self.db.event(db, asset_id, "retired", {"blob": asset["blob"]})
             return self.get(asset_id, db)
 
@@ -84,5 +88,6 @@ class Assets:
             asset = self.get(asset_id, db)
             self.blobs.resolve(asset["blob"], verify=True)
             db.execute("UPDATE assets SET state='ready' WHERE id=?", (asset_id,))
+            self._availability.pop(asset_id, None)
             self.db.event(db, asset_id, "restored", {})
             return self.get(asset_id, db)

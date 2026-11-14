@@ -45,6 +45,7 @@ class Application:
             self.imprints = Imprints(self.db, self.blobs, self.tickets, self.captions)
             self.resources = Resources(self.db, self.blobs)
             self.recovery = self.tickets.recover()
+            self.analysis_recovery = self.analysis.reconcile()
             self.renderer = Renderer(settings, self.blobs, self.tickets, self.planner, self.processes, self.artifacts)
             if start_workers:
                 self.renderer.start()
@@ -55,6 +56,7 @@ class Application:
     def health(self):
         return {"service": "reel-loom", "version": "0.1.0", "status": "ready",
                 **self.db.health(), "blobs": self.blobs.stats(), "recovery": self.recovery,
+                "analysis_recovery": self.analysis_recovery,
                 "limits": self.settings.public()}
 
     def close(self):

@@ -1,4 +1,4 @@
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_info(version INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS blobs(
@@ -47,7 +47,8 @@ CREATE INDEX IF NOT EXISTS artifact_ticket ON artifacts(ticket);
 CREATE TABLE IF NOT EXISTS analyses(
  id TEXT PRIMARY KEY, asset TEXT NOT NULL REFERENCES assets(id),
  kind TEXT NOT NULL, settings TEXT NOT NULL, result TEXT NOT NULL,
- fingerprint TEXT NOT NULL UNIQUE, created REAL NOT NULL
+ fingerprint TEXT NOT NULL UNIQUE, created REAL NOT NULL,
+ state TEXT NOT NULL DEFAULT 'valid' CHECK(state IN ('valid','invalidated'))
 );
 CREATE TABLE IF NOT EXISTS imprints(
  id TEXT PRIMARY KEY, ticket TEXT NOT NULL REFERENCES tickets(id),
@@ -64,3 +65,18 @@ CREATE TABLE IF NOT EXISTS request_keys(
  response TEXT NOT NULL, created REAL NOT NULL, PRIMARY KEY(scope,key)
 );
 """
+
+# Additive upgrades for databases created by earlier schema versions. Each
+# migration preserves existing rows; history must never be rewritten or dropped.
+MIGRATIONS = {
+    2: [
+        "ALTER TABLE analyses ADD COLUMN state TEXT NOT NULL DEFAULT 'valid' "
+        "CHECK(state IN ('valid','invalidated'))",
+    ],
+}
+
+# Idempotent indexes created after any migration has run, so their columns
+# exist on both freshly created and upgraded databases.
+INDEXES = [
+    "CREATE INDEX IF NOT EXISTS analysis_asset ON analyses(asset,state)",
+]

@@ -33,6 +33,10 @@ class AudioAnalysis:
                 "analysis_source", "Source content changed during analysis", 409)
         require(admission["source_state"] == "ready" and admission["accepted_at"] <= now(),
                 "asset_retired", "Source media was unavailable when analysis was accepted", 409)
+        # The handoff guard: a source retired while the measurement was still
+        # running cannot register its result, even though admission was valid.
+        require(asset["state"] == "ready",
+                "asset_retired", "Source media retired before the analysis could be handed off", 409)
         return asset
 
     def normalize(self, kind, raw):
@@ -53,7 +57,9 @@ class AudioAnalysis:
         asset = admission["asset"]
         fingerprint = digest({"blob": asset["blob"], "kind": kind, "settings": settings, "algorithm": 1})
         with self.db.read() as db:
-            existing = db.execute("SELECT id FROM analyses WHERE fingerprint=?", (fingerprint,)).fetchone()
+            existing = db.execute(
+                "SELECT id FROM analyses WHERE fingerprint=? AND state='valid'",
+                (fingerprint,)).fetchone()
             if existing:
                 return self.get(existing["id"], db)
         if kind == "loudness":
@@ -76,12 +82,27 @@ class AudioAnalysis:
     def persist(self, asset_id, kind, settings, result, fingerprint, admission):
         with self.db.write_unit() as db:
             self._complete(db, asset_id, kind, settings, admission)
-            row = db.execute("SELECT id FROM analyses WHERE fingerprint=?", (fingerprint,)).fetchone()
+            row = db.execute(
+                "SELECT id,state FROM analyses WHERE fingerprint=?", (fingerprint,)).fetchone()
             if row:
+                # A row invalidated by an earlier retirement window can become
+                # effective again once the source is restored and the same
+                # measurement is re-run. Re-registering moves its timestamp to
+                # the new acceptance instant so later reconciliations judge it
+                # against the current lifecycle rather than the old window.
+                if row["state"] != "valid":
+                    revalidated_at = now()
+                    db.execute("UPDATE analyses SET state='valid',created=? WHERE id=?",
+                               (revalidated_at, row["id"]))
+                    self.db.event(db, asset_id, "analysis_revalidated",
+                                  {"analysis": row["id"], "kind": kind, "created": revalidated_at})
                 return self.get(row["id"], db)
             analysis_id = identifier("analysis")
-            db.execute("INSERT INTO analyses VALUES(?,?,?,?,?,?,?)",
-                       (analysis_id, asset_id, kind, canonical(settings), canonical(result), fingerprint, now()))
+            db.execute(
+                "INSERT INTO analyses(id,asset,kind,settings,result,fingerprint,created,state) "
+                "VALUES(?,?,?,?,?,?,?,'valid')",
+                (analysis_id, asset_id, kind, canonical(settings), canonical(result),
+                 fingerprint, now()))
             self.db.event(db, asset_id, "analyzed", {"analysis": analysis_id, "kind": kind})
             return self.get(analysis_id, db)
 
@@ -114,10 +135,51 @@ class AudioAnalysis:
             with self.db.read() as read:
                 return self.get(analysis_id, read)
         row = db.execute("SELECT * FROM analyses WHERE id=?", (analysis_id,)).fetchone()
-        if row is None:
+        if row is None or row["state"] != "valid":
+            # Invalidated handoffs are retained for audit but never served as
+            # effective measurements.
             raise missing("analysis", analysis_id)
         return {**dict(row), "settings": json.loads(row["settings"]), "result": json.loads(row["result"])}
 
     def list(self, asset_id):
         with self.db.read() as db:
-            return [self.get(row["id"], db) for row in db.execute("SELECT id FROM analyses WHERE asset=? ORDER BY created,id", (asset_id,))]
+            rows = db.execute(
+                "SELECT id FROM analyses WHERE asset=? AND state='valid' ORDER BY created,id",
+                (asset_id,)).fetchall()
+            return [self.get(row["id"], db) for row in rows]
+
+    def reconcile(self):
+        """Classify analysis rows against retirement history at startup.
+
+        A measurement is only effective if its source was ready at the moment
+        the result was registered. Rows registered while the source was
+        retired are invalidated; they remain on disk for audit but are
+        excluded from every read path. Legal historical measurements,
+        including those of currently retired sources, stay valid.
+        """
+        invalidated, retained = [], 0
+        with self.db.write_unit() as db:
+            rows = db.execute("SELECT id,asset,created FROM analyses ORDER BY asset,created").fetchall()
+            for row in rows:
+                # Sequence orders the lifecycle authoritatively; an event at
+                # the same wall-clock instant as the registration is treated
+                # as already in effect (the retire/persist write transactions
+                # are serialized, so an exact tie only occurs in test setups).
+                lifecycle = db.execute(
+                    "SELECT kind,created FROM events "
+                    "WHERE subject=? AND kind IN ('retired','restored') ORDER BY sequence",
+                    (row["asset"],)).fetchall()
+                ready_at_registration = True
+                for event in lifecycle:
+                    if event["created"] > row["created"]:
+                        break
+                    ready_at_registration = event["kind"] == "restored"
+                if ready_at_registration:
+                    retained += 1
+                    continue
+                current = db.execute("SELECT state FROM analyses WHERE id=?", (row["id"],)).fetchone()
+                if current is not None and current["state"] != "invalidated":
+                    db.execute("UPDATE analyses SET state='invalidated' WHERE id=?", (row["id"],))
+                    self.db.event(db, row["asset"], "analysis_invalidated", {"analysis": row["id"]})
+                    invalidated.append(row["id"])
+        return {"valid": retained, "invalidated": invalidated}

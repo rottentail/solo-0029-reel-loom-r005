@@ -29,22 +29,22 @@ class Planner:
         return {**snapshot, "fingerprint": digest(snapshot)}
 
     def _compile_sources(self, snapshot):
+        # Execution reads the frozen source closure captured when the ticket
+        # was accepted. Retirement is a lifecycle flag, not a physical delete:
+        # accepted and frozen tickets must still render their original cut, so
+        # the current asset state is deliberately not consulted here. New uses
+        # are blocked earlier, at reel authoring and ticket enqueue time.
         sources = {}
         referenced = {item["asset"] for item in snapshot["document"]["slices"]}
+        kind = snapshot["look"]["spec"]["kind"]
         for asset_id in referenced:
             frozen = snapshot["sources"][asset_id]
-            current = self.assets.get(asset_id)
-            require(current["state"] == "ready", "asset_retired",
-                    "Source media is unavailable for rendition execution", 409)
-            require(current["blob"] == frozen["blob"], "source_changed",
-                    "Source content differs from the accepted rendition", 409)
-            metadata = current["metadata"]
-            kind = snapshot["look"]["spec"]["kind"]
+            metadata = frozen["metadata"]
             require(metadata["has_video"] if kind == "video" else metadata["has_audio"],
-                    "source_format", "Source no longer supports the accepted look", 409)
+                    "source_format", "Frozen source no longer supports the accepted look", 409)
             sources[asset_id] = {
                 "id": asset_id,
-                "blob": current["blob"],
+                "blob": frozen["blob"],
                 "metadata": metadata,
             }
         return sources
